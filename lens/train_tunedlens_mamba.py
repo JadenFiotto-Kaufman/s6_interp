@@ -5,6 +5,7 @@ import accelerate
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, Subset
+from mamba_ssm.ops.triton.layernorm import rms_norm_fn
 from tqdm import tqdm
 
 import wandb
@@ -14,7 +15,33 @@ accelerator = accelerate.Accelerator(log_with="wandb")
 
 global_step = 0
 
-def val_epoch(dataloader, model, lens, max_length):
+# takes in hidden states and converts to probability dists
+def kl_divergence(outputs, labels, model=None):
+    labels = torch.nn.functional.log_softmax(decode(labels, model), dim=-1)
+    outputs = torch.nn.functional.log_softmax(decode(outputs, model), dim=-1)
+    
+    return torch.sum(
+        labels.exp() * (labels - outputs), dim=-1
+    ).mean()
+
+# take a final hidden state and apply lm_head 
+def decode(hidden_states, model):
+    norm_f = model.local_model.backbone.norm_f
+
+    decoded = hidden_states.node.graph.add(
+        target=rms_norm_fn,
+        args=[hidden_states, norm_f.weight, norm_f.bias],
+        kwargs={
+            "eps": norm_f.eps,
+            "residual": None,
+            "prenorm": False,
+            "residual_in_fp32": True,
+        },
+    )
+
+    return model.lm_head(decoded)
+
+def val_epoch(dataloader, model, lens, max_length, criterion):
     log_losses = None
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Val:", disable=not accelerator.is_local_main_process)):
@@ -37,9 +64,15 @@ def val_epoch(dataloader, model, lens, max_length):
                             lens.layer_translators[layer_idx](hidden_state) + hidden_state
                         )
 
-                        loss = torch.nn.functional.mse_loss(
-                            predicted_hidden_state, last_output
-                        )
+                        loss = None
+                        if criterion == "mse":
+                            loss = torch.nn.functional.mse_loss(
+                                predicted_hidden_state, last_output
+                            )
+                        elif criterion == "kl":
+                            loss = kl_divergence(
+                                predicted_hidden_state, last_output, model=model
+                            ) 
 
                         losses.append(loss.save())
 
@@ -61,7 +94,7 @@ def val_epoch(dataloader, model, lens, max_length):
         accelerator.log(log_losses, step=global_step)
 
 
-def train_epoch(dataloader, optimizer, model, lens, max_length):
+def train_epoch(dataloader, optimizer, model, lens, max_length, criterion):    
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Train:", disable=not accelerator.is_local_main_process)):
         optimizer.zero_grad()
 
@@ -83,9 +116,15 @@ def train_epoch(dataloader, optimizer, model, lens, max_length):
                         lens.layer_translators[layer_idx](hidden_state) + hidden_state
                     )
 
-                    loss = torch.nn.functional.mse_loss(
-                        predicted_hidden_state, last_output
-                    )
+                    loss = None
+                    if criterion == "mse":
+                        loss = torch.nn.functional.mse_loss(
+                            predicted_hidden_state, last_output
+                        )
+                    elif criterion == "kl":
+                        loss = kl_divergence(
+                            predicted_hidden_state, last_output, model=model
+                        ) 
 
                     losses.append(loss.save())
 
@@ -102,6 +141,7 @@ def train_epoch(dataloader, optimizer, model, lens, max_length):
 
         accelerator.log(log_losses)
 
+        # TODO add accumulation?
         optimizer.step()
 
         if accelerator.is_local_main_process:
@@ -109,7 +149,7 @@ def train_epoch(dataloader, optimizer, model, lens, max_length):
             global_step += 1
 
 
-def train(lr, model, seed, batch_size, epochs, dataset, max_length):
+def train(lr, model, seed, batch_size, epochs, dataset, max_length, criterion):
     accelerator.init_trackers(
         project_name="my_project",
         config={
@@ -143,6 +183,9 @@ def train(lr, model, seed, batch_size, epochs, dataset, max_length):
             translator = torch.nn.Linear(d_model, d_model, bias=True)
             translator.weight.data.zero_()
             translator.bias.data.zero_()
+            
+            # page 5: initialize all transformers to identity transform 
+            torch.nn.init.eye_(translator.weight)
 
             self.layer_translators = torch.nn.ModuleList(
                 [deepcopy(translator) for _ in range(len(layers) - 1)]
@@ -163,7 +206,7 @@ def train(lr, model, seed, batch_size, epochs, dataset, max_length):
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    optimizer = torch.optim.Adam(lens.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(lens.parameters(), lr=lr, weight_decay=10e-3)
 
     (
         model.local_model,
@@ -178,10 +221,10 @@ def train(lr, model, seed, batch_size, epochs, dataset, max_length):
         for epoch in range(epochs):
             print(f"Epoch: {epoch}")
 
-            train_epoch(train_dataloader, optimizer, model, lens, max_length)
+            train_epoch(train_dataloader, optimizer, model, lens, max_length, criterion)
 
             accelerator.wait_for_everyone()
-            val_epoch(val_dataloader, model, lens, max_length)
+            val_epoch(val_dataloader, model, lens, max_length, criterion)
             accelerator.wait_for_everyone()
 
             accelerator.save_model(lens, f"tunedlens_{epoch}")
@@ -207,5 +250,6 @@ parser.add_argument("--batch_size", default=30, type=int)
 parser.add_argument("--epochs", default=200, type=int)
 parser.add_argument("--dataset", default="JeanKaddour/minipile")
 parser.add_argument("--max_length", default=20, type=int)
+parser.add_argument("--criterion", choices=['mse', 'kl'], type=str, default='mse')
 
 train(**vars(parser.parse_args()))
