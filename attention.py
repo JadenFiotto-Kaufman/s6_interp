@@ -16,16 +16,19 @@ def main(prompt, out_path, repo_id, absv, softmax):
     tokenizer.pad_token_id = tokenizer.eos_token_id
     model = MambaInterp(repo_id, device="cuda", tokenizer=tokenizer)
 
-    with model.invoke(prompt, fwd_args={"inference": True}) as invoker:
+    with model.trace(prompt) as tracer:
         layer_values = []
+        layer_magnitude_values = []
 
-        for layer in model.backbone.layers:
+        for layer_idx, layer in enumerate(model.backbone.layers):
             x = layer.mixer.ssm.input[0][0].save()
 
             C = layer.mixer.ssm.input[0][4].save()
 
             discA = layer.mixer.ssm.discA.output.save()
             discB = layer.mixer.ssm.discB.output.save()
+
+            layer_magnitude_values.append((layer.output[0] - layer.output[1]).norm(dim=2).save())
 
             # Compute Bx for all tokens before.
             Bx = torch.einsum("bdln,bdl->bdln", discB, x)
@@ -68,7 +71,7 @@ def main(prompt, out_path, repo_id, absv, softmax):
             layer_values.append(source_values)
 
     # Convert to values and combine to one tensor (n_layer, n_tokens, n_tokens)
-            
+
     def post(proxy):
 
         value = proxy.value
@@ -80,13 +83,16 @@ def main(prompt, out_path, repo_id, absv, softmax):
         return value
 
     values = util.apply(layer_values, post, Proxy)
-    values = torch.tensor(values)
+    values = torch.tensor(values).detach()
 
     if softmax:
         values = values.softmax(dim=2)
+    else:
+        values[values == -float('inf')] = 0
+        values = values / values.sum(dim=2, keepdim=True)
 
     clean_tokens = [
-        model.tokenizer.decode(token) for token in invoker.input["input_ids"][0]
+        model.tokenizer.decode(token) for token in tracer._invoker.inputs[0]["input_ids"][0]
     ]
     token_labels = [f"{token}_{index}" for index, token in enumerate(clean_tokens)]
 
@@ -108,6 +114,25 @@ def main(prompt, out_path, repo_id, absv, softmax):
     for layer_idx in range(values.shape[0]):
         vis(values[layer_idx], token_labels, f"layer_{layer_idx}", out_path)
 
+    vis(values.mean(dim=0), token_labels, f"layer_mean", out_path)
+
+
+    ssm_values = util.apply(layer_magnitude_values, lambda x : x.value, Proxy)
+    ssm_values = torch.concatenate(ssm_values).detach().cpu()
+    fig = px.imshow(
+        ssm_values,
+        color_continuous_midpoint=0.0,
+        color_continuous_scale="RdBu",
+        labels={"y": "Layer", "x": "Token"},
+        x=token_labels,
+        y=list(range(ssm_values.shape[0])),
+        title="norm",
+    )
+
+    fig.write_image(os.path.join(out_path, f"norm.png"))
+
+    breakpoint()
+
 
 if __name__ == "__main__":
     import argparse
@@ -116,7 +141,7 @@ if __name__ == "__main__":
 
     parser.add_argument("prompt")
     parser.add_argument("--out_path", default="./attn")
-    parser.add_argument("--repo_id", default="state-spaces/mamba-130m")
+    parser.add_argument("--repo_id", default="state-spaces/mamba-2.8b")
     parser.add_argument("--absv", action="store_true", default=False)
     parser.add_argument("--softmax", action="store_true", default=False)
 
