@@ -75,10 +75,10 @@ def val_epoch(dataloader, model, lens, max_length, direct, N):
 
             with model.trace() as tracer:
                 with tracer.invoke(
-                    batch["text"], scan=False, truncation=True, max_length=max_length
+                    batch["text"], scan=True, truncation=True, max_length=max_length
                 ) as invoker:
                     if direct:
-                        logits = model.lm_head.output # (batch_size, seq_len, vocab_size)
+                        logits = model.lm_head.output.save() # (batch_size, seq_len, vocab_size)
                         labels = logits[:, N:, :]
                     else:
                         last_output = (
@@ -128,7 +128,7 @@ def train_epoch(dataloader, optimizer, model, lens, max_length, direct, N):
                 batch["text"], scan=True, truncation=True, max_length=max_length
             ) as invoker:
                 if direct:
-                    logits = model.lm_head.output # (batch_size, seq_len, vocab_size)
+                    logits = model.lm_head.output.save() # (batch_size, seq_len, vocab_size)
                     labels = logits[:, N:, :]
                 else:
                     last_output = (
@@ -197,7 +197,7 @@ def train(repo_id, direct, lr, seed, batch_size, epochs, dataset, max_length, N)
         "EleutherAI/gpt-neox-20b", padding_side="left"
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = MambaInterp(repo_id, tokenizer=tokenizer) # device="cuda"
+    model = MambaInterp(repo_id, tokenizer=tokenizer, dispatch=True, device="cuda:0")
 
     # half precision
     model.to(torch.bfloat16)
@@ -226,13 +226,12 @@ def train(repo_id, direct, lr, seed, batch_size, epochs, dataset, max_length, N)
     optimizer = torch.optim.Adam(lens.parameters(), lr=lr)
 
     (
-        model,
         optimizer,
         train_dataloader,
         val_dataloader,
         lens
     ) = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, lens
+        optimizer, train_dataloader, val_dataloader, lens
     )
 
     try:
